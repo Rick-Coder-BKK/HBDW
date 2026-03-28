@@ -30,11 +30,12 @@ const NOTE = {
 // ---------------------------------------------------------------------------
 // Module-level state
 // ---------------------------------------------------------------------------
-let ctx = null;
-let masterGain = null;
+let ctx         = null;
+let masterGain  = null;
 let bgIntervals = [];
-let bgTimeouts = [];
-let _isMuted = false;
+let bgTimeouts  = [];
+let _isMuted    = false;
+let _unlocked   = false; // true once iOS audio pipeline is fully open
 
 // ---------------------------------------------------------------------------
 // Internal helpers
@@ -124,9 +125,46 @@ function playTone(type, startFreq, endFreq, duration, gain, when, attack = 0.005
 }
 
 /**
- * Guard: returns true if AudioContext exists.
- * Also resumes a suspended context (iOS Safari creates ctx in 'suspended' state).
+ * Create the AudioContext + play a 1-frame silent buffer.
+ * iOS Safari requires BOTH steps inside a synchronous user-gesture call stack
+ * to fully unlock the audio pipeline. Safe to call multiple times.
  */
+function tryUnlock() {
+  if (_unlocked) return;
+  try {
+    if (!ctx) {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      createMasterGain();
+    }
+    // Playing a silent 1-frame buffer is the mandatory iOS unlock trick.
+    // ctx.resume() alone is not sufficient on Safari — you must schedule audio.
+    const silentBuf = ctx.createBuffer(1, 1, ctx.sampleRate);
+    const silentSrc = ctx.createBufferSource();
+    silentSrc.buffer = silentBuf;
+    silentSrc.connect(ctx.destination);
+    silentSrc.start(0);
+    ctx.resume().then(() => { _unlocked = true; });
+  } catch (e) {
+    console.warn('Web Audio unlock failed:', e);
+  }
+}
+
+// ── Auto-unlock on the very first user interaction anywhere on the page ───────
+// Fires in the capture phase — before React's handlers — so the AudioContext
+// is created & unlocked synchronously in the gesture stack on iOS Safari.
+if (typeof document !== 'undefined') {
+  const _autoUnlock = () => {
+    tryUnlock();
+    document.removeEventListener('touchstart', _autoUnlock, true);
+    document.removeEventListener('mousedown',  _autoUnlock, true);
+    document.removeEventListener('keydown',    _autoUnlock, true);
+  };
+  document.addEventListener('touchstart', _autoUnlock, { capture: true, passive: true });
+  document.addEventListener('mousedown',  _autoUnlock, { capture: true });
+  document.addEventListener('keydown',    _autoUnlock, { capture: true });
+}
+
+/** Guard: returns true if AudioContext is running. */
 function isReady() {
   if (!ctx || !masterGain) return false;
   if (ctx.state === 'suspended') ctx.resume();
@@ -369,22 +407,12 @@ const tracks = {
 export const Sounds = {
   isMuted: false,
 
-  /** Call once on first user interaction to create / resume the AudioContext. */
+  /**
+   * Explicitly unlock audio — call this in any button handler for extra safety.
+   * The global touchstart listener already handles the common case automatically.
+   */
   init() {
-    if (ctx) {
-      // Already created — just ensure it's running (suspended on iOS after bg/tab switch)
-      if (ctx.state === 'suspended') ctx.resume();
-      return;
-    }
-    try {
-      ctx = new (window.AudioContext || window.webkitAudioContext)();
-      createMasterGain();
-      // iOS Safari creates the context in 'suspended' state even inside a gesture —
-      // calling resume() here (still within the gesture stack) unlocks audio.
-      if (ctx.state === 'suspended') ctx.resume();
-    } catch (e) {
-      console.warn('Web Audio API not available:', e);
-    }
+    tryUnlock();
   },
 
   /**
