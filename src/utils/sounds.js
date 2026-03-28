@@ -123,9 +123,14 @@ function playTone(type, startFreq, endFreq, duration, gain, when, attack = 0.005
   osc.stop(when + duration + 0.01);
 }
 
-/** Guard: returns true if AudioContext is ready for playback. */
+/**
+ * Guard: returns true if AudioContext exists.
+ * Also resumes a suspended context (iOS Safari creates ctx in 'suspended' state).
+ */
 function isReady() {
-  return ctx !== null && masterGain !== null;
+  if (!ctx || !masterGain) return false;
+  if (ctx.state === 'suspended') ctx.resume();
+  return true;
 }
 
 /** Cancel all pending background music timers. */
@@ -364,11 +369,22 @@ const tracks = {
 export const Sounds = {
   isMuted: false,
 
-  /** Call once on first user interaction to create the AudioContext. */
+  /** Call once on first user interaction to create / resume the AudioContext. */
   init() {
-    if (ctx) return; // already initialised
-    ctx = new (window.AudioContext || window.webkitAudioContext)();
-    createMasterGain();
+    if (ctx) {
+      // Already created — just ensure it's running (suspended on iOS after bg/tab switch)
+      if (ctx.state === 'suspended') ctx.resume();
+      return;
+    }
+    try {
+      ctx = new (window.AudioContext || window.webkitAudioContext)();
+      createMasterGain();
+      // iOS Safari creates the context in 'suspended' state even inside a gesture —
+      // calling resume() here (still within the gesture stack) unlocks audio.
+      if (ctx.state === 'suspended') ctx.resume();
+    } catch (e) {
+      console.warn('Web Audio API not available:', e);
+    }
   },
 
   /**
@@ -376,6 +392,7 @@ export const Sounds = {
    * @param {'home'|'quiz'|'game'} track
    */
   playBgMusic(track) {
+    this.init(); // resume suspended context if coming back from background
     if (!isReady()) return;
     this.stopBgMusic();
 
@@ -406,9 +423,11 @@ export const Sounds = {
 
   /**
    * Play a one-shot sound effect.
+   * Implicitly calls init() so any tap/click can unlock audio on mobile.
    * @param {string} effect
    */
   play(effect) {
+    this.init(); // safe to call repeatedly; resumes suspended ctx on iOS
     if (!isReady()) return;
     const fn = effects[effect];
     if (!fn) {
